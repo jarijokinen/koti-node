@@ -2,6 +2,10 @@
 #include <ble_advdata.h>
 #include <bsp.h>
 #include <nordic_common.h>
+#include <nrf.h>
+#include <nrf_drv_ppi.h>
+#include <nrf_drv_saadc.h>
+#include <nrf_drv_timer.h>
 #include <nrf_log.h>
 #include <nrf_log_ctrl.h>
 #include <nrf_log_default_backends.h>
@@ -12,12 +16,20 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+
 #define KOTI_BEACON_UUID 0x29, 0x39, 0x01
 #define KOTI_COMPANY_IDENTIFIER 0x0059
 #define KOTI_BLE_CONN_CFG_TAG 1
 #define KOTI_ADV_INTERVAL MSEC_TO_UNITS(100, UNIT_0_625_MS)
+#define KOTI_ADC_SAMPLES 5
 
 #define DEAD_BEEF 0xdeadbeef
+
+static const nrf_drv_timer_t m_timer = NRF_DRV_TIMER_INSTANCE(3);
+static nrf_saadc_value_t m_buffer_pool[2][KOTI_ADC_SAMPLES];
+static nrf_ppi_channel_t m_ppi_channel;
+static uint32_t m_adc_evt_counter;
+static uint16_t m_light_value;
 
 static ble_gap_adv_params_t m_adv_params;
 static uint8_t m_adv_handle = BLE_GAP_ADV_SET_HANDLE_NOT_SET;
@@ -50,20 +62,17 @@ static void koti_adv_start(void)
   APP_ERROR_CHECK(err_code);
 }
 
-static void koti_adv_init(void) {
+static void koti_adv_init(void)
+{
   ret_code_t err_code;
   
   ble_advdata_manuf_data_t manuf_data;
   ble_advdata_t advdata;
 
-  /* TODO: replace hard-coded light value by a value from adc */
-  uint16_t light = 0x1234; /* value between 0 - 4095 (0x0000 - 0x0fff) */
-  uint8_t flags = BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE;
-
   uint8_t payload[] = {
     KOTI_BEACON_UUID,
-    ((light >> 8) & 0xff),
-    (light & 0xff)
+    ((m_light_value >> 8) & 0xff),
+    (m_light_value & 0xff)
   };
   manuf_data.company_identifier = KOTI_COMPANY_IDENTIFIER;
   manuf_data.data.p_data = (uint8_t *)payload;
@@ -71,7 +80,7 @@ static void koti_adv_init(void) {
 
   memset(&advdata, 0, sizeof(advdata));
   advdata.name_type = BLE_ADVDATA_NO_NAME;
-  advdata.flags = flags;
+  advdata.flags = BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE;
   advdata.p_manuf_specific_data = &manuf_data;
 
   memset(&m_adv_params, 0, sizeof(m_adv_params));
@@ -85,13 +94,10 @@ static void koti_adv_init(void) {
   err_code = ble_advdata_encode(&advdata, m_adv_data.adv_data.p_data, 
     &m_adv_data.adv_data.len);
   APP_ERROR_CHECK(err_code);
-
-  err_code = sd_ble_gap_adv_set_configure(&m_adv_handle, &m_adv_data, 
-    &m_adv_params);
-  APP_ERROR_CHECK(err_code);
 }
 
-static void koti_ble_stack_init(void) {
+static void koti_ble_stack_init(void)
+{
   ret_code_t err_code;
 
   err_code = nrf_sdh_enable_request();
@@ -102,6 +108,88 @@ static void koti_ble_stack_init(void) {
   APP_ERROR_CHECK(err_code);
 
   err_code = nrf_sdh_ble_enable(&ram_start);
+  APP_ERROR_CHECK(err_code);
+}
+
+static void koti_timer_handler(nrf_timer_event_t event_type, void *p_context)
+{
+}
+
+static void koti_saadc_sampling_event_init(void)
+{
+  ret_code_t err_code;
+
+  err_code = nrf_drv_ppi_init();
+  APP_ERROR_CHECK(err_code);
+
+  nrf_drv_timer_config_t timer_config = NRF_DRV_TIMER_DEFAULT_CONFIG;
+  timer_config.frequency = NRF_TIMER_FREQ_31250Hz;
+
+  err_code = nrf_drv_timer_init(&m_timer, &timer_config, koti_timer_handler);
+  APP_ERROR_CHECK(err_code);
+
+  uint32_t ticks = nrf_drv_timer_ms_to_ticks(&m_timer, 400);
+  nrf_drv_timer_extended_compare(&m_timer, NRF_TIMER_CC_CHANNEL0, ticks, 
+    NRF_TIMER_SHORT_COMPARE0_CLEAR_MASK, false);
+  nrf_drv_timer_enable(&m_timer);
+
+  uint32_t timer_compare_event_addr = nrf_drv_timer_compare_event_address_get(
+    &m_timer, NRF_TIMER_CC_CHANNEL0);
+  uint32_t saadc_sample_task_addr = nrf_drv_saadc_sample_task_get();
+
+  err_code = nrf_drv_ppi_channel_alloc(&m_ppi_channel);
+  APP_ERROR_CHECK(err_code);
+
+  err_code = nrf_drv_ppi_channel_assign(m_ppi_channel, 
+    timer_compare_event_addr, saadc_sample_task_addr);
+  APP_ERROR_CHECK(err_code);
+}
+
+static void koti_saadc_sampling_event_enable(void)
+{
+  ret_code_t err_code = nrf_drv_ppi_channel_enable(m_ppi_channel);
+  APP_ERROR_CHECK(err_code);
+}
+
+static void koti_saadc_callback(nrf_drv_saadc_evt_t const *p_event)
+{
+  if (p_event->type == NRF_DRV_SAADC_EVT_DONE) {
+    ret_code_t err_code;
+
+    err_code = nrf_drv_saadc_buffer_convert(p_event->data.done.p_buffer, 
+      KOTI_ADC_SAMPLES);
+    APP_ERROR_CHECK(err_code);
+
+    for (int i = 0; i < KOTI_ADC_SAMPLES; i++) {
+      m_light_value = p_event->data.done.p_buffer[i];
+    }
+    koti_adv_init();
+    m_adc_evt_counter++;
+  }
+}
+
+static void koti_saadc_init(void)
+{
+  ret_code_t err_code;
+
+  nrf_drv_saadc_config_t saadc_config = NRF_DRV_SAADC_DEFAULT_CONFIG;
+  saadc_config.resolution = NRF_SAADC_RESOLUTION_12BIT;
+
+  nrf_saadc_channel_config_t channel_config = 
+    NRF_DRV_SAADC_DEFAULT_CHANNEL_CONFIG_SE(NRF_SAADC_INPUT_AIN0);
+  channel_config.gain = NRF_SAADC_GAIN1_6;
+  channel_config.reference = NRF_SAADC_REFERENCE_VDD4;
+
+  err_code = nrf_drv_saadc_init(&saadc_config, koti_saadc_callback);
+  APP_ERROR_CHECK(err_code);
+  
+  err_code = nrf_drv_saadc_channel_init(0, &channel_config);
+  APP_ERROR_CHECK(err_code);
+
+  err_code = nrf_drv_saadc_buffer_convert(m_buffer_pool[0], KOTI_ADC_SAMPLES);
+  APP_ERROR_CHECK(err_code);
+
+  err_code = nrf_drv_saadc_buffer_convert(m_buffer_pool[1], KOTI_ADC_SAMPLES);
   APP_ERROR_CHECK(err_code);
 }
 
@@ -129,15 +217,23 @@ int main(void)
   /** Initialize BLE stack and advertising */
   koti_ble_stack_init();
   koti_adv_init();
+  
+  err_code = sd_ble_gap_adv_set_configure(&m_adv_handle, &m_adv_data, 
+    &m_adv_params);
+  APP_ERROR_CHECK(err_code);
+  
+  /** Initialize SAADC */
+  koti_saadc_sampling_event_init();
+  koti_saadc_init();
+  koti_saadc_sampling_event_enable();
 
   /** Start advertising */
   NRF_LOG_INFO("koti-node started");
   koti_adv_start();
 
   while (1) {
-    if (!NRF_LOG_PROCESS()) {
-      nrf_pwr_mgmt_run();
-    }
+    err_code = sd_app_evt_wait();
+    APP_ERROR_CHECK(err_code);
   }
 
   return 0;
